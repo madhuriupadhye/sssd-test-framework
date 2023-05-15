@@ -763,9 +763,20 @@ class LDAPUser(LDAPObject[LDAPHost, LDAP]):
         :return: Self.
         :rtype: LDAPUser
         """
+        import pdb; pdb.set_trace()
+        #print(attrs)
         attrs: LDAPRecordAttributes = {"objectClass": "passkeyUser", "passkey": passkey_mapping}
         self._modify(add=attrs)
+
+        #if 'objectClass' not in attrs.values():
+        #    attrs: LDAPRecordAttributes = {"objectClass": "passkeyUser", "passkey": passkey_mapping}
+        #    print(attrs)
+        #    self._modify(add=attrs)
+        #else:
+        #    attrs: LDAPRecordAttributes = {"passkey": passkey_mapping}
+        #    self._set(attrs)
         return self
+
 
     def passkey_remove(self, passkey_mapping: str) -> LDAPUser:
         """

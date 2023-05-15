@@ -450,7 +450,7 @@ class IPAUser(IPAObject):
         self._modify(attrs, input=password)
         return self
 
-    def passkey_add(self, passkey_mapping: str) -> IPAUser:
+    def passkey_add(self, passkey_mapping: str | list[str]) -> IPAUser:
         """
         Add passkey mapping to the user.
 
@@ -460,6 +460,9 @@ class IPAUser(IPAObject):
         :rtype: IPAUser
         """
         self._exec("add-passkey", [passkey_mapping])
+        #print = f"[{', '.join(passkey_mapping)}]"
+        #self._exec("add-passkey", to_list(passkey_mapping))
+        
         return self
 
     def passkey_add_register(
