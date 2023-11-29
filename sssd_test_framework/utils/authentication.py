@@ -349,6 +349,8 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
             rf"""
             #!/bin/bash
 
+            umask 022
+
             LD_PRELOAD=/opt/random.so umockdev-run \
                 --device '{device_path}' \
                 --ioctl '/dev/hidraw1={ioctl_path}' \
