@@ -341,7 +341,7 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
         return result.rc == 0
 
     def passkey_with_output(
-        self, username: str, *, pin: str | int, device: str, ioctl: str, script: str, command: str = "exit 0"
+        self, username: str, *, device: str, ioctl: str, script: str, pin: str | int | None = None, command: str = "exit 0"
     ) -> tuple[int, int, str, str]:
         """
         Call ``su - $username`` and authenticate the user with passkey.
@@ -422,6 +422,7 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
             set timeout {DEFAULT_AUTHENTICATION_TIMEOUT}
             set prompt "\n.*\[#\$>\] $"
             set command "{command}"
+            set pin "{pin}"
 
             spawn "{playback_umockdev}"
 
@@ -430,11 +431,14 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
                 timeout {{exitmsg "Unexpected output" 201}}
                 eof {{exitmsg "Unexpected end of file" 202}}
             }}
-
-            expect {{
-                "Enter PIN:*" {{send -- "{pin}\r"}}
-                timeout {{exitmsg "Unexpected output" 201}}
-                eof {{exitmsg "Unexpected end of file" 202}}
+            
+            if {{string trimleft $pin eq "" }} {{
+                expect {{
+                    "Enter PIN:*" {{send -- "{pin}\r"}}
+                    timeout {{exitmsg "Unexpected output" 201}}
+                    eof {{exitmsg "Unexpected end of file" 202}}
+                }}
+                eof {{exitmsg "Password authentication successful without PIN" 0}}
             }}
 
             expect {{
@@ -465,7 +469,7 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
         return result.rc, cmdrc, stdout, result.stderr
 
     def passkey(
-        self, username: str, *, pin: str | int, device: str, ioctl: str, script: str, command: str = "exit 0"
+        self, username: str, *, pin: str | int = "exit 0", device: str, ioctl: str, script: str, command: str = "exit 0"
     ) -> bool:
         """
         Call ``su - $username`` and authenticate the user with passkey.
