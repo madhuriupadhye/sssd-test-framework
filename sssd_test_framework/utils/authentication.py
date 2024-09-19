@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from enum import Enum
 
 from pytest_mh import MultihostHost, MultihostUtility
 from pytest_mh.conn import Connection, ProcessResult
@@ -22,6 +23,12 @@ __all__ = [
 DEFAULT_AUTHENTICATION_TIMEOUT: int = 60
 """Default timeout for authentication failure."""
 
+class PasskeyAuthenticationUseCases(Enum):
+    PASSKEY_WITH_PIN = 0,
+    PASSKEY_WITH_PIN_AND_PROMPTS = 1,
+    PASSKEY_WITHOUT_PIN_WITH_PROMPTS = 2,
+    PASSKEY_WITHOUT_PIN_WITHOUT_PROMPTS = 3,
+    PASSKEY_FALLBACK_TO_PASSWORD = 4,
 
 class AuthenticationUtils(MultihostUtility[MultihostHost]):
     """
@@ -341,7 +348,10 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
         return result.rc == 0
 
     def passkey_with_output(
-        self, username: str, *, pin: str | int, device: str, ioctl: str, script: str, command: str = "exit 0"
+        self, username: str, *, device: str, ioctl: str, script: str, pin: str | int | None = None,
+            interactive_prompt: str = "Insert your Passkey device, then press ENTER.",
+            touch_prompt: str = "Please touch the device.", command: str = "exit 0",
+            auth_method: PasskeyAuthenticationUseCases = PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN
     ) -> tuple[int, int, str, str]:
         """
         Call ``su - $username`` and authenticate the user with passkey.
@@ -360,6 +370,13 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
         :type command: str
         :return: Tuple containing [return code, command code, stdout, stderr].
         :rtype: Tuple[int, int, str, str]
+
+
+        pin plus touch => default => (Insert your Passkey device, then press ENTER.Enter PIN:)
+        no pin => (insert your Passkey device, then press ENTER)
+        pin plus password => (insert your Passkey device, then press ENTER, Enter PIN:<enter>,
+        Password:<password>)
+        default plus touch and interactive prompt =>
         """
         self.fs.backup("/usr/libexec/sssd/passkey_child")
         self.fs.copy("/usr/libexec/sssd/passkey_child", "/usr/libexec/sssd/passkey_child.orig")
@@ -367,6 +384,17 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
         device_path = self.fs.upload_to_tmp(device, mode="a=r")
         ioctl_path = self.fs.upload_to_tmp(ioctl, mode="a=r")
         script_path = self.fs.upload_to_tmp(script, mode="a=r")
+
+        match auth_method:
+            case (PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN,
+                  PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN_AND_PROMPTS):
+                if pin is None:
+                    raise ValueError(f"PIN is required for {str(auth_method)}")
+            case (PasskeyAuthenticationUseCases.PASSKEY_WITHOUT_PIN,
+                  PasskeyAuthenticationUseCases.PASSKEY_FALLBACK_TO_PASSWORD,
+                  PasskeyAuthenticationUseCases.PASSKEY_WITHOUT_PIN_WITHOUT_PROMPTS):
+                if pin is not None:
+                    raise ValueError(f"PIN is not required for {str(auth_method)}")
 
         run_su = self.fs.mktmp(
             rf"""
@@ -385,7 +413,6 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
                 """,
             mode="a=rx",
         )
-
         playback_umockdev = self.fs.mktmp(
             rf"""
             #!/bin/bash
@@ -399,6 +426,7 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
             mode="a=rx",
         )
 
+        import pdb; pdb.set_trace()
         result = self.host.conn.expect(
             rf"""
             # Disable debug output
@@ -422,29 +450,56 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
             set timeout {DEFAULT_AUTHENTICATION_TIMEOUT}
             set prompt "\n.*\[#\$>\] $"
             set command "{command}"
-
+            set auth_method "{auth_method}"
+            
             spawn "{playback_umockdev}"
 
-            expect {{
-                "Insert your passkey device, then press ENTER*" {{send -- "\n"}}
-                timeout {{exitmsg "Unexpected output" 201}}
-                eof {{exitmsg "Unexpected end of file" 202}}
-            }}
-
-            expect {{
-                "Enter PIN:*" {{send -- "{pin}\r"}}
-                timeout {{exitmsg "Unexpected output" 201}}
-                eof {{exitmsg "Unexpected end of file" 202}}
+            if {{ $auth_method eq "{PasskeyAuthenticationUseCases.PASSKEY_WITHOUT_PIN_WITHOUT_PROMPTS}") }} {{
+                expect {{
+                    "{interactive_prompt}*" {{ send -- "\n"}}
+                    timeout {{exitmsg "Unexpected output" 201}}
+                    eof {{exitmsg "Unexpected end of file" 202}}
+                }}
+            }} elseif {{ ($auth_method eq "{PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN}") || ($auth_method eq 
+            "{PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN_AND_PROMPTS}")}} {{
+                expect {{
+                    "Enter PIN:*" {{send -- "{pin}\r"}}
+                    timeout {{exitmsg "Unexpected output" 401}}
+                    eof {{exitmsg "Unexpected end of file" 402}}
+                }}
+                if {{ $auth_method eq "{PasskeyAuthenticationUseCases.PASSKEY_WITH_PIN_AND_PROMPTS}" }} {{
+                    expect {{
+                        "{touch_prompt}*" {{ send -- "\n"}}
+                        eof {{exitmsg "Password authentication successful" 0}}
+                        timeout {{exitmsg "Unexpected output" 501}}
+                    }}
+                }}
+            }} elseif {{ $auth_method eq "{PasskeyAuthenticationUseCases.PASSKEY_FALLBACK_TO_PASSWORD}" }} {{
+                expect {{
+                    "Enter PIN:*" {{send -- "\r"}}
+                    timeout {{exitmsg "Unexpected output" 201}}
+                    eof {{exitmsg "Unexpected end of file" 202}}
+                }}
+                expect {{
+                    "Password:*" {{send -- "Secret123\r"}}
+                    timeout {{exitmsg "Unexpected output" 301}}
+                    eof {{exitmsg "Unexpected end of file" 302}}
+                }}
+            }} elseif {{ $auth_method eq "{PasskeyAuthenticationUseCases.PASSKEY_WITHOUT_PIN_WITH_PROMPTS}" }} {{
+                expect {{
+                    "{touch_prompt}*" {{ send -- "\n"}}
+                    eof {{exitmsg "Password authentication successful" 0}}
+                    timeout {{exitmsg "Unexpected output" 501}}
+                }}
             }}
 
             expect {{
                 "Authentication failure" {{exitmsg "Authentication failure" 1}}
                 eof {{exitmsg "Password authentication successful" 0}}
-                timeout {{exitmsg "Unexpected output" 201}}
+                timeout {{exitmsg "Unexpected output" 601}}
             }}
 
-            exitmsg "Unexpected code path" 203
-
+            exitmsg "Unexpected code path" 803
             """,
             verbose=False,
         )
@@ -464,9 +519,7 @@ class SUAuthenticationUtils(MultihostUtility[MultihostHost]):
 
         return result.rc, cmdrc, stdout, result.stderr
 
-    def passkey(
-        self, username: str, *, pin: str | int, device: str, ioctl: str, script: str, command: str = "exit 0"
-    ) -> bool:
+    def passkey(self, username: str, *, device: str, ioctl: str, script: str, pin: str | int | None = None, command: str = "exit 0") -> bool:
         """
         Call ``su - $username`` and authenticate the user with passkey.
 
@@ -1148,3 +1201,4 @@ class PasswdUtils(MultihostUtility[MultihostHost]):
             raise ExpectScriptError(result.rc)
 
         return result.rc == 0
+
