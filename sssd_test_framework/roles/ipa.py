@@ -595,7 +595,7 @@ class IPAUser(IPAObject):
             rf"""
             #!/bin/bash
 
-            LD_PRELOAD=/opt/random.so umockdev-run \
+            LD_PRELOAD=/opt/files/random.so umockdev-run \
                 --device '{device_path}'                \
                 --ioctl '/dev/hidraw1={ioctl_path}'     \
                 --script '/dev/hidraw1={script_path}'   \
