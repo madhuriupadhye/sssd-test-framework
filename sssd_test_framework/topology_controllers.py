@@ -181,42 +181,11 @@ class IPATrustADTopologyController(ProvisionedBackupTopologyController):
         self.logger.info(f"Configuring DNS forwarder for {trusted.domain} on {ipa.hostname}")
         ipa.kinit()
 
-        # Check if forwarder already exists
-        result = ipa.conn.exec(
-            ["ipa", "dnsforwardzone-show", trusted.domain],
-            raise_on_error=False,
-        )
-
-        if result.rc == 0:
-            self.logger.info(f"DNS forwarder for {trusted.domain} already exists, skipping")
-            return
-
-        # Resolve AD server hostname to IP address (forwarder requires IP)
-        # Use getattr to safely access the host attribute from the connection
-        ad_hostname = getattr(trusted.conn, "host", trusted.hostname)
-        try:
-            ad_ip = socket.gethostbyname(ad_hostname)
-        except socket.gaierror:
-            self.logger.error(
-                f"Could not resolve hostname '{ad_hostname}'. "
-                "Please ensure it is resolvable from the test controller."
-            )
-            raise
-
-        # Add DNS forward zone pointing to the AD server IP
-        ipa.conn.exec(
-            [
-                "ipa",
-                "dnsforwardzone-add",
-                trusted.domain,
-                f"--forwarder={ad_ip}",
-                "--forward-policy=only",
-            ]
-        )
-
-        # Restart named to ensure it picks up the new forwarder zone
-        ipa.conn.exec(["systemctl", "restart", "named"])
-        self.logger.info(f"DNS forwarder for {trusted.domain} configured successfully")
+        # Add global DNS forwarder pointing to the AD server
+        ad_host = getattr(trusted.conn, "host", trusted.hostname)
+        ad_ip = socket.gethostbyname(ad_host)
+        ipa.conn.exec(["ipa", "dnsconfig-mod", f"--forwarder={ad_ip}"])
+        self.logger.info(f"DNS forwarder {ad_ip} configured successfully")
 
     # If this command is run on freshly started containers, it is possible the IPA is not yet
     # fully ready to create the trust. It takes a while for it to start working.
