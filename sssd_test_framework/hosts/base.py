@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import logging
 import re
 from typing import Any, Generator
 
@@ -15,6 +16,8 @@ from pytest_mh.utils.services import SystemdServices
 
 from ..config import SSSDMultihostDomain
 from ..misc import retry
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "BaseHost",
@@ -32,6 +35,84 @@ class BaseHost(MultihostBackupHost[SSSDMultihostDomain]):
     def __init__(self, *args, **kwargs) -> None:
         # restore is handled in topology controllers
         super().__init__(*args, auto_restore=False, **kwargs)
+
+    def _reconnect_ssh(self) -> bool:
+        """
+        Attempt to re-establish the SSH connection.
+
+        :return: True if reconnection succeeded, False otherwise.
+        :rtype: bool
+        """
+        try:
+            self.conn.disconnect()
+        except Exception:
+            pass
+
+        try:
+            self.conn.connect()
+            return True
+        except Exception:
+            return False
+
+    def _ensure_ssh_connected(self) -> bool:
+        """
+        Verify SSH is alive; reconnect if the channel is broken.
+
+        Runs a trivial command to probe the connection. On failure,
+        disconnects and reconnects so that subsequent operations
+        (remove_backup, utility teardown) use a fresh session.
+
+        :return: True if SSH is usable, False if reconnect also failed.
+        :rtype: bool
+        """
+        try:
+            self.conn.run("true")
+            return True
+        except Exception:
+            logger.info("SSH connection to %s is dead, reconnecting", self.hostname)
+            return self._reconnect_ssh()
+
+    def pytest_teardown(self) -> None:
+        """
+        Remove backup files from the host.
+
+        Ensures the SSH connection is alive before teardown so that both
+        remove_backup and the utility teardown (reload_daemon, etc.)
+        that follows can succeed. If the connection is broken
+        (e.g. after a topology change), it is re-established first.
+        If teardown still fails after reconnect, the error is logged
+        as a warning and swallowed so the test run does not fail
+        when all tests actually passed.
+
+        When the host is completely unreachable (e.g. VM destroyed after
+        topology change), utility dependencies are cleared to prevent
+        the subsequent mh_utility_teardown_dependencies from also failing.
+        """
+        if not self._ensure_ssh_connected():
+            logger.warning(
+                "Host %s is unreachable, skipping teardown and clearing utility dependencies",
+                self.hostname,
+            )
+            self._mh_utility_dependencies.clear()
+            return
+
+        try:
+            super().pytest_teardown()
+        except Exception as e:
+            logger.warning("Teardown failed for %s, attempting SSH reconnect: %s", self.hostname, e)
+            if self._reconnect_ssh():
+                try:
+                    super().pytest_teardown()
+                    return
+                except Exception as retry_err:
+                    logger.warning("Teardown retry failed for %s: %s", self.hostname, retry_err)
+            else:
+                logger.warning(
+                    "SSH reconnect failed for %s, host is unreachable; "
+                    "clearing utility dependencies",
+                    self.hostname,
+                )
+                self._mh_utility_dependencies.clear()
 
     @property
     def features(self) -> dict[str, bool]:

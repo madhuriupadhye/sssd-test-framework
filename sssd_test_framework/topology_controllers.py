@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import tempfile
 import textwrap
@@ -16,6 +17,8 @@ from .hosts.keycloak import KeycloakHost
 from .hosts.ldap import LDAPHost
 from .hosts.samba import SambaHost
 from .misc.ssh import retry_command
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "LDAPTopologyController",
@@ -43,7 +46,44 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().init(*args, **kwargs)
         self.provisioned = self.name in self.multihost.provisioned_topologies
 
+    def _ensure_hosts_connected(self, raise_on_failure: bool = False) -> None:
+        """
+        Verify SSH to all topology hosts is alive; reconnect broken sessions.
+
+        Topology changes (hostname changes, domain join/leave) can break
+        SSH channels. This method probes each host and re-establishes
+        connections as needed before setup or teardown operations.
+
+        :param raise_on_failure: If True, raise an exception when a host
+            cannot be reconnected. Used during topology_setup so that
+            unreachable hosts cause the topology to fail and subsequent
+            tests are skipped rather than each one timing out individually.
+            Before raising, utility dependencies on the dead host are
+            cleared so that topology teardown does not also time out.
+        :type raise_on_failure: bool
+        """
+        for host in self.hosts:
+            try:
+                host.conn.run("true")
+            except Exception:
+                logger.info("SSH connection to %s is dead, reconnecting", host.hostname)
+                try:
+                    host.conn.disconnect()
+                except Exception:
+                    pass
+                try:
+                    host.conn.connect()
+                except Exception:
+                    logger.warning("Failed to reconnect SSH to %s", host.hostname)
+                    if raise_on_failure:
+                        host._mh_utility_dependencies.clear()
+                        raise RuntimeError(
+                            f"Host {host.hostname} is unreachable and cannot be reconnected"
+                        )
+
     def topology_setup(self, *args, **kwargs) -> None:
+        self._ensure_hosts_connected(raise_on_failure=True)
+
         if self.provisioned:
             self.logger.info(f"Topology '{self.name}' is already provisioned")
             return
@@ -51,12 +91,16 @@ class ProvisionedBackupTopologyController(BackupTopologyController[SSSDMultihost
         super().topology_setup(*args, **kwargs)
 
     def topology_teardown(self, *args, **kwargs) -> None:
+        self._ensure_hosts_connected()
+
         if self.provisioned:
             return
 
         super().topology_teardown(*args, **kwargs)
 
     def teardown(self) -> None:
+        self._ensure_hosts_connected()
+
         if self.provisioned:
             self.restore_vanilla()
             return
