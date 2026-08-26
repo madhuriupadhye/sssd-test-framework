@@ -96,6 +96,7 @@ class ClientHost(BaseHost, BaseLinuxHost):
         raise NotImplementedError("Starting Client service is not implemented.")
 
     def stop(self) -> None:
+        self.svc.stop("sssd-kcm.service", raise_on_error=False)
         self.svc.stop("sssd.service")
 
     def backup(self) -> Any:
@@ -148,24 +149,29 @@ class ClientHost(BaseHost, BaseLinuxHost):
         backup_path = str(backup_data)
 
         self.logger.info(f"Restoring SSSD data from {backup_path}")
+        self.svc.stop("sssd-kcm.service", raise_on_error=False)
+        self.svc.stop("sssd.service", raise_on_error=False)
         self.conn.run(
             f"""
             set -ex
 
             function restore {{
-                rm --force --recursive "$2"
-                if [ -d "$1" ] || [ -f "$1" ]; then
+                if [ -d "$1" ]; then
+                    mkdir -p "$2"
+                    rm --force --recursive "$2"/* || :
+                    cp --force --archive "$1"/. "$2"/
+                elif [ -f "$1" ]; then
                     cp --force --archive "$1" "$2"
                 fi
             }}
 
-            rm --force --recursive /etc/sssd /var/lib/sss /var/log/sssd /home/*
+            rm --force --recursive /etc/sssd/* /var/lib/sss/* /var/log/sssd/* /home/* || :
             restore "{backup_path}/krb5.conf" /etc/krb5.conf
             restore "{backup_path}/krb5.keytab" /etc/krb5.keytab
             restore "{backup_path}/config" /etc/sssd
             restore "{backup_path}/logs" /var/log/sssd
             restore "{backup_path}/lib" /var/lib/sss
-            cp --force --archive "{backup_path}/home/*" /home/ || :
+            cp --force --archive "{backup_path}/home"/. /home/ || :
             """,
             log_level=ProcessLogLevel.Error,
         )

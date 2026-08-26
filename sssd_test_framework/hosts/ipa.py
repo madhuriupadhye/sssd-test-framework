@@ -202,8 +202,11 @@ class IPAHost(BaseDomainHost, BaseLinuxHost):
                 set -x
 
                 function restore {{
-                    rm --force --recursive "$2"
-                    if [ -d "$1" ] || [ -f "$1" ]; then
+                    if [ -d "$1" ]; then
+                        mkdir -p "$2"
+                        rm --force --recursive "$2"/* || :
+                        cp --force --archive "$1"/. "$2"/
+                    elif [ -f "$1" ]; then
                         cp --force --archive "$1" "$2"
                     fi
                 }}
@@ -219,7 +222,7 @@ class IPAHost(BaseDomainHost, BaseLinuxHost):
 
                 set -e
 
-                rm --force --recursive /etc/sssd /var/lib/sss /var/log/sssd
+                rm --force --recursive /etc/sssd/* /var/lib/sss/* /var/log/sssd/* || :
                 restore "{backup_path}/krb5.conf" /etc/krb5.conf
                 restore "{backup_path}/krb5.keytab" /etc/krb5.keytab
                 restore "{backup_path}/config" /etc/sssd
@@ -231,5 +234,7 @@ class IPAHost(BaseDomainHost, BaseLinuxHost):
 
         backup_path = str(backup_data)
         self.logger.info(f"Restoring IPA server from {backup_path}")
+        self.svc.stop("sssd-kcm.service", raise_on_error=False)
+        self.svc.stop("sssd.service", raise_on_error=False)
         _restore()
         self.svc.restart("sssd.service")
