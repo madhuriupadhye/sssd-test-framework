@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import textwrap
+from pathlib import PurePosixPath
 from typing import Any
 
-import ldap
 from pytest_mh.conn import ProcessLogLevel
 
 from .base import BaseLDAPDomainHost, BaseLinuxHost
@@ -23,7 +23,8 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
 
     .. note::
 
-        Full backup and restore is supported.
+        Full backup and restore is supported by copying ``/etc/dirsrv`` and
+        ``/var/lib/dirsrv`` (same approach as IPA in PR #288).
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -280,8 +281,16 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         :param backup_data: Backup data.
         :type backup_data: Any | None
         """
-        # Nothing to do since we store backup in memory
-        pass
+        if backup_data is None:
+            return
+
+        if not isinstance(backup_data, PurePosixPath):
+            raise TypeError(f"Expected PurePosixPath, got {type(backup_data)}")
+
+        self.conn.run(
+            f'rm --force --recursive "{backup_data}"',
+            log_level=ProcessLogLevel.Error,
+        )
 
     def start(self) -> None:
         self.svc.start(self._ldap_service_name)
@@ -293,34 +302,73 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         """
         Backup all directory server data.
 
-        Full backup of ``cn=config`` and default naming context is performed.
-        This is done by simple LDAP search on given base dn and remembering the
-        contents. The operation is usually very fast.
+        Stop 389-ds, wait for ``ns-slapd`` to exit (same race fix as IPA PR
+        #298), copy ``/etc/dirsrv`` and ``/var/lib/dirsrv``, then start and wait
+        until LDAP answers. This avoids LDAP modify-based restore failures such
+        as ``ldap.UNWILLING_TO_PERFORM`` that left users behind and caused later
+        ``ldap.ALREADY_EXISTS``, and avoids ``ldap.SERVER_DOWN`` from copying
+        or reconnecting while the server is still stopping/starting.
 
         :return: Backup data.
         :rtype: Any
         """
         self.logger.info("Creating backup of LDAP server")
+        self.disconnect()
 
-        data = self.ldap_conn.search_s(self.naming_context, ldap.SCOPE_SUBTREE)
-        config = self.ldap_conn.search_s("cn=config", ldap.SCOPE_BASE)
-        nc = self.ldap_conn.search_s(self.naming_context, ldap.SCOPE_BASE, attrlist=["aci"])
+        result = self.conn.run(
+            """
+            set -x
 
-        dct = self.ldap_result_to_dict(data)
-        dct.update(self.ldap_result_to_dict(config))
-        dct.update(self.ldap_result_to_dict(nc))
+            function backup {
+                if [ -d "$1" ] || [ -f "$1" ]; then
+                    cp --force --archive "$1" "$2"
+                fi
+            }
 
-        return dct
+            set -e
+
+            path=`mktemp -d`
+
+            systemctl stop dirsrv.target
+            set +e
+            count=0
+            while pgrep -a ns-slapd > /dev/null; do
+                if [ "$count" -ge "60" ]; then
+                    echo "Directory server failed to stop in 60 seconds"
+                    exit 1
+                fi
+                ((count++))
+                sleep 1
+            done
+            set -e
+
+            backup /etc/dirsrv "$path/dirsrv-etc"
+            backup /var/lib/dirsrv "$path/dirsrv-lib"
+            systemctl start dirsrv.target
+
+            # systemctl returning does not mean LDAP is answering yet
+            for _ in $(seq 30); do
+                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+                sleep 1
+            done
+            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+
+            echo $path
+            """,
+            log_level=ProcessLogLevel.Error,
+        )
+
+        return PurePosixPath(result.stdout_lines[-1].strip())
 
     def restore(self, backup_data: Any | None) -> None:
         """
         Restore directory server data.
 
-        Current directory server content in ``cn=config`` and default naming
-        context is modified to its original data. This is done by computing a
-        difference between original data obtained by :func:`backup` and then
-        calling add, delete and modify operations to convert current state to
-        the original state. This operation is usually very fast.
+        Stop 389-ds, wait for ``ns-slapd`` to exit, replace ``/etc/dirsrv`` and
+        ``/var/lib/dirsrv`` from the backup created by :meth:`backup`, then start
+        and wait until LDAP answers. File copy restores the full database state
+        (including test users), so teardown cannot leave leftovers that fail
+        later with ``ldap.ALREADY_EXISTS``.
 
         :return: Backup data.
         :rtype: Any
@@ -328,60 +376,48 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         if backup_data is None:
             return
 
-        self.logger.info("Restoring LDAP server from memory")
+        if not isinstance(backup_data, PurePosixPath):
+            raise TypeError(f"Expected PurePosixPath, got {type(backup_data)}")
 
-        if not isinstance(backup_data, dict):
-            raise TypeError(f"Expected dict, got {type(backup_data)}")
+        backup_path = str(backup_data)
+        self.logger.info(f"Restoring LDAP server from {backup_path}")
 
-        data = self.ldap_conn.search_s(self.naming_context, ldap.SCOPE_SUBTREE)
-        config = self.ldap_conn.search_s("cn=config", ldap.SCOPE_BASE)
-        nc = self.ldap_conn.search_s(self.naming_context, ldap.SCOPE_BASE, attrlist=["aci"])
+        self.disconnect()
+        self.conn.run(
+            f"""
+            set -x
 
-        # Convert list of tuples to dictionary for better lookup
-        data = self.ldap_result_to_dict(data)
-        data.update(self.ldap_result_to_dict(config))
-        data.update(self.ldap_result_to_dict(nc))
+            function restore {{
+                rm --force --recursive "$2"
+                if [ -d "$1" ] || [ -f "$1" ]; then
+                    cp --force --archive "$1" "$2"
+                fi
+            }}
 
-        for dn, attrs in reversed(data.items()):
-            # Restore records that were modified
-            if dn in backup_data:
-                original_attrs = backup_data[dn]
-                modlist = ldap.modlist.modifyModlist(attrs, original_attrs)
-                modlist = self.__filter_modlist(dn, modlist)
-                if modlist:
-                    self.ldap_conn.modify_s(dn, modlist)
+            set -e
 
-        for dn, attrs in reversed(data.items()):
-            # Delete records that were added
-            if dn not in backup_data:
-                self.ldap_conn.delete_s(dn)
-                continue
+            systemctl stop dirsrv.target
+            set +e
+            count=0
+            while pgrep -a ns-slapd > /dev/null; do
+                if [ "$count" -ge "60" ]; then
+                    echo "Directory server failed to stop in 60 seconds"
+                    exit 1
+                fi
+                ((count++))
+                sleep 1
+            done
+            set -e
 
-        for dn, attrs in backup_data.items():
-            # Add back records that were deleted
-            if dn not in data:
-                self.ldap_conn.add_s(dn, list(attrs.items()))
+            restore "{backup_path}/dirsrv-etc" /etc/dirsrv
+            restore "{backup_path}/dirsrv-lib" /var/lib/dirsrv
+            systemctl start dirsrv.target
 
-    def __filter_modlist(self, dn: str, modlist: list) -> list:
-        """
-        Remove special items that can not be modified from ``modlist``.
-
-        :param dn: Object's DN.
-        :type dn: str
-        :param modlist: LDAP modlist.
-        :type modlist: list
-        :return: Filtered modlist.
-        :rtype: list
-        """
-        if dn != "cn=config":
-            return modlist
-
-        result = []
-        for op, attr, value in modlist:
-            # We are not allowed to touch these
-            if attr.startswith("nsslapd"):
-                continue
-
-            result.append((op, attr, value))
-
-        return result
+            for _ in $(seq 30); do
+                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+                sleep 1
+            done
+            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+            """,
+            log_level=ProcessLogLevel.Error,
+        )
