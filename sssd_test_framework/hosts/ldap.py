@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import textwrap
+from pathlib import PurePosixPath
 from typing import Any
 
-import ldap
 from pytest_mh.conn import ProcessLogLevel
 
 from .base import BaseLDAPDomainHost, BaseLinuxHost
@@ -22,7 +23,9 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
 
     .. note::
 
-        Full backup and restore is supported.
+        Full backup and restore is supported by copying ``/etc/dirsrv`` and
+        ``/var/lib/dirsrv`` (same approach as IPA in PR #288). Extra naming
+        contexts from tests are covered by the filesystem restore.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -30,6 +33,7 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
 
         self._features: dict[str, bool] | None = None
         self._ldap_service_name = self.config.get("ldap_service_name", "dirsrv@localhost.service")
+        self._ldap_cert_dir = self.config.get("ldap_cert_dir", "/var/data/certs")
         self.extra_naming_contexts: set[str] = set()
         """Additional naming contexts created for tests (multi-suffix rootDSE)."""
 
@@ -74,6 +78,205 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
 
         return self._features
 
+    def create_additional_instance(
+        self,
+        name: str,
+        *,
+        hostname: str,
+        port: int,
+        secure_port: int,
+        suffix: str | None = None,
+    ) -> None:
+        """
+        Create, configure and start an additional 389ds instance on this host.
+
+        The primary instance is provisioned when the host image is built, this
+        only ever adds further instances alongside it.
+
+        The instance shares the host's bind credentials and TLS certificate, so
+        it can be used as a second, distinct LDAP server in failover topologies.
+        SSSD keys its failover server list on the hostname, therefore ``hostname``
+        must differ from the primary instance's name for the two to be treated
+        as separate servers, even though they share an address.
+
+        The operation is idempotent, an existing instance of the same name is
+        left untouched.
+
+        This is meant to be called from a topology controller, so that the
+        instance is shared by every test in the topology instead of being paid
+        for per test. See
+        :class:`~sssd_test_framework.topology_controllers.MultiLDAPTopologyController`
+        for the implementation used by ``KnownTopology.MultiLDAP``, and
+        subclass it to change the instance name or ports rather than calling
+        this directly.
+
+        :param name: Instance name, the resulting unit is ``dirsrv@<name>.service``.
+        :type name: str
+        :param hostname: Fully qualified name the instance is reachable under.
+        :type hostname: str
+        :param port: LDAP port.
+        :type port: int
+        :param secure_port: LDAPS port.
+        :type secure_port: int
+        :param suffix: Naming context, defaults to the primary instance's suffix.
+        :type suffix: str | None, optional
+        """
+        if suffix is None:
+            suffix = self.naming_context
+
+        self.logger.info(f"Creating 389ds instance '{name}' on {self.hostname} as {hostname}:{port}")
+
+        self.conn.run(
+            textwrap.dedent(f"""
+            set -ex
+
+            # Nothing to do if the instance already exists.
+            if dsctl -l | grep -qx 'slapd-{name}'; then
+                exit 0
+            fi
+
+            # The extra ports are not part of ldap_port_t, so a confined
+            # ns-slapd cannot bind them until they are labelled, and they must
+            # be opened in the firewall. Both are skipped where the tooling is
+            # absent or inactive, such as containers run with SELinux disabled.
+            if command -v semanage > /dev/null && selinuxenabled 2> /dev/null; then
+                for extra_port in {port} {secure_port}; do
+                    semanage port -a -t ldap_port_t -p tcp "$extra_port" 2> /dev/null \
+                        || semanage port -m -t ldap_port_t -p tcp "$extra_port"
+                done
+            fi
+
+            # Permanent, because the instance has to outlive the individual
+            # tests and pytest_mh's Firewalld utility reloads firewalld in its
+            # per test setup and teardown, which drops runtime only rules.
+            if command -v firewall-cmd > /dev/null && firewall-cmd --state > /dev/null 2>&1; then
+                firewall-cmd --permanent --add-port={port}/tcp --add-port={secure_port}/tcp
+                firewall-cmd --reload
+            fi
+
+            cat > '/root/{name}.inf' <<EOF
+            [general]
+            config_version = 2
+            full_machine_name = {hostname}
+
+            [slapd]
+            instance_name = {name}
+            port = {port}
+            secure_port = {secure_port}
+            root_dn = {self.binddn}
+            root_password = {self.bindpw}
+
+            [backend-userroot]
+            suffix = {suffix}
+            create_suffix_entry = True
+            EOF
+
+            dscreate from-file '/root/{name}.inf'
+
+            # Share the primary instance's certificate. It carries the alias as a
+            # subjectAltName, so TLS to the second name passes hostname validation.
+            dsconf '{name}' security ca-certificate add --file '{self._ldap_cert_dir}/ca.crt' --name 'sssd-ca'
+            dsconf '{name}' security ca-certificate set-trust-flags 'sssd-ca' --flags 'CT,,'
+
+            ARGS=
+            # Workaround for https://github.com/389ds/389-ds-base/issues/7470
+            if dsctl '{name}' tls import-server-key-cert --help 2>&1 | grep -q -- '--nickname'; then
+                ARGS='--nickname Server-Cert'
+            fi
+            dsctl '{name}' tls import-server-key-cert $ARGS \
+                '{self._ldap_cert_dir}/{self.hostname}.crt' '{self._ldap_cert_dir}/{self.hostname}.key'
+
+            systemctl restart 'dirsrv@{name}.service'
+
+            # The unit returning does not mean the instance is already
+            # answering, wait for it so that callers and the modify below do
+            # not race against startup. The final search is unguarded on
+            # purpose, so that an instance that never comes up fails here
+            # rather than somewhere less obvious.
+            for _ in $(seq 30); do
+                ldapsearch -x -H 'ldap://localhost:{port}' -b '' -s base > /dev/null 2>&1 && break
+                sleep 1
+            done
+            ldapsearch -x -H 'ldap://localhost:{port}' -b '' -s base > /dev/null
+            """),
+            log_level=ProcessLogLevel.Error,
+        )
+
+        # Match the primary instance, which grants anonymous read access.
+        result = self.conn.run(
+            f"""ldapmodify -D '{self.binddn}' -w '{self.bindpw}' -H 'ldap://localhost:{port}' -x""",
+            input=(
+                f"dn: {suffix}\n"
+                "changetype: modify\n"
+                "add: aci\n"
+                'aci: (targetattr=*)(version 3.0; acl "Enable anyone read"; '
+                'allow (read, search, compare)(userdn="ldap:///anyone");)\n'
+            ),
+            log_level=ProcessLogLevel.Error,
+            raise_on_error=False,
+        )
+
+        # The aci is already there if the instance is being reused, anything
+        # else is a real failure and must not pass silently.
+        if result.rc != 0 and "Type or value exists" not in result.stderr:
+            result.throw()
+
+    def remove_additional_instance(self, name: str) -> None:
+        """
+        Stop and remove an instance created by :func:`create_additional_instance`.
+
+        Also drops the firewall rule and SELinux port label that
+        :func:`create_additional_instance` added, so the host is left as it was
+        found. The operation is idempotent, removing a non existent instance is
+        a no-op.
+
+        Called from a topology controller's teardown, see
+        :class:`~sssd_test_framework.topology_controllers.MultiLDAPTopologyController`.
+
+        :param name: Instance name.
+        :type name: str
+        """
+        self.logger.info(f"Removing 389ds instance '{name}' from {self.hostname}")
+
+        self.conn.run(
+            textwrap.dedent(f"""
+            set -ex
+
+            dse='/etc/dirsrv/slapd-{name}/dse.ldif'
+            extra_ports=
+            if [ -f "$dse" ]; then
+                # Recover the ports from the instance itself so the host is
+                # left as it was found, rather than trusting the caller to
+                # pass the same values again.
+                extra_ports=$(sed -n 's/^nsslapd-\\(secure\\)\\?[Pp]ort: *//p' "$dse" | sort -u)
+            fi
+
+            if dsctl -l | grep -qx 'slapd-{name}'; then
+                dsctl '{name}' remove --do-it
+            fi
+
+            rm --force '/root/{name}.inf'
+
+            for extra_port in $extra_ports; do
+                if command -v firewall-cmd > /dev/null && firewall-cmd --state > /dev/null 2>&1; then
+                    firewall-cmd --permanent --remove-port="$extra_port"/tcp || :
+                fi
+
+                # Only removes a locally added label, entries that come from
+                # the base policy are left alone.
+                if command -v semanage > /dev/null && selinuxenabled 2> /dev/null; then
+                    semanage port -d -t ldap_port_t -p tcp "$extra_port" 2> /dev/null || :
+                fi
+            done
+
+            if [ -n "$extra_ports" ] \
+                && command -v firewall-cmd > /dev/null && firewall-cmd --state > /dev/null 2>&1; then
+                firewall-cmd --reload
+            fi
+            """),
+            log_level=ProcessLogLevel.Error,
+        )
+
     def remove_backup(self, backup_data: Any | None) -> None:
         """
         Remove backup data from the host.
@@ -81,8 +284,16 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         :param backup_data: Backup data.
         :type backup_data: Any | None
         """
-        # Nothing to do since we store backup in memory
-        pass
+        if backup_data is None:
+            return
+
+        if not isinstance(backup_data, PurePosixPath):
+            raise TypeError(f"Expected PurePosixPath, got {type(backup_data)}")
+
+        self.conn.run(
+            f'rm --force --recursive "{backup_data}"',
+            log_level=ProcessLogLevel.Error,
+        )
 
     def start(self) -> None:
         self.svc.start(self._ldap_service_name)
@@ -94,28 +305,73 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         """
         Backup all directory server data.
 
-        Full backup of ``cn=config``, every naming context (including any extra
-        suffixes), mapping-tree entries, and backend instances is performed.
-        This is done by simple LDAP search on given base dns and remembering the
-        contents. The operation is usually very fast.
+        Stop 389-ds, wait for ``ns-slapd`` to exit (same race fix as IPA PR
+        #298), copy ``/etc/dirsrv`` and ``/var/lib/dirsrv``, then start and wait
+        until LDAP answers. This avoids LDAP modify-based restore failures such
+        as ``ldap.UNWILLING_TO_PERFORM`` that left users behind and caused later
+        ``ldap.ALREADY_EXISTS``, and avoids ``ldap.SERVER_DOWN`` from copying
+        or reconnecting while the server is still stopping/starting.
 
         :return: Backup data.
         :rtype: Any
         """
         self.logger.info("Creating backup of LDAP server")
-        return self._ldap_state()
+        self.disconnect()
+
+        result = self.conn.run(
+            """
+            set -x
+
+            function backup {
+                if [ -d "$1" ] || [ -f "$1" ]; then
+                    cp --force --archive "$1" "$2"
+                fi
+            }
+
+            set -e
+
+            path=`mktemp -d`
+
+            systemctl stop dirsrv.target
+            set +e
+            count=0
+            while pgrep -a ns-slapd > /dev/null; do
+                if [ "$count" -ge "60" ]; then
+                    echo "Directory server failed to stop in 60 seconds"
+                    exit 1
+                fi
+                ((count++))
+                sleep 1
+            done
+            set -e
+
+            backup /etc/dirsrv "$path/dirsrv-etc"
+            backup /var/lib/dirsrv "$path/dirsrv-lib"
+            systemctl start dirsrv.target
+
+            # systemctl returning does not mean LDAP is answering yet
+            for _ in $(seq 30); do
+                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+                sleep 1
+            done
+            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+
+            echo $path
+            """,
+            log_level=ProcessLogLevel.Error,
+        )
+
+        return PurePosixPath(result.stdout_lines[-1].strip())
 
     def restore(self, backup_data: Any | None) -> None:
         """
         Restore directory server data.
 
-        Current directory server content in ``cn=config``, naming contexts,
-        mapping trees, and backends is modified to its original data. This is
-        done by computing a difference between original data obtained by
-        :func:`backup` and then calling add, delete and modify operations to
-        convert current state to the original state. Extra naming contexts
-        created during a test are removed because they are absent from the
-        backup. This operation is usually very fast.
+        Stop 389-ds, wait for ``ns-slapd`` to exit, replace ``/etc/dirsrv`` and
+        ``/var/lib/dirsrv`` from the backup created by :meth:`backup`, then start
+        and wait until LDAP answers. File copy restores the full database state
+        (including test users), so teardown cannot leave leftovers that fail
+        later with ``ldap.ALREADY_EXISTS``.
 
         :return: Backup data.
         :rtype: Any
@@ -123,124 +379,49 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         if backup_data is None:
             return
 
-        self.logger.info("Restoring LDAP server from memory")
+        if not isinstance(backup_data, PurePosixPath):
+            raise TypeError(f"Expected PurePosixPath, got {type(backup_data)}")
 
-        if not isinstance(backup_data, dict):
-            raise TypeError(f"Expected dict, got {type(backup_data)}")
+        backup_path = str(backup_data)
+        self.logger.info(f"Restoring LDAP server from {backup_path}")
 
-        data = self._ldap_state()
+        self.disconnect()
+        self.conn.run(
+            f"""
+            set -x
 
-        for dn, attrs in reversed(data.items()):
-            # Restore records that were modified
-            if dn in backup_data:
-                original_attrs = backup_data[dn]
-                modlist = ldap.modlist.modifyModlist(attrs, original_attrs)
-                modlist = self.__filter_modlist(dn, modlist)
-                if modlist:
-                    self.ldap_conn.modify_s(dn, modlist)
+            function restore {{
+                rm --force --recursive "$2"
+                if [ -d "$1" ] || [ -f "$1" ]; then
+                    cp --force --archive "$1" "$2"
+                fi
+            }}
 
-        # Delete records that were added (deepest entries first; drop suffix
-        # data before mapping-tree/backend config that references it).
-        to_delete = [dn for dn in data if dn not in backup_data]
-        to_delete.sort(key=self._restore_delete_key)
-        for dn in to_delete:
-            try:
-                self.ldap_conn.delete_s(dn)
-            except ldap.NO_SUCH_OBJECT:
-                continue
+            set -e
 
-        for dn, attrs in backup_data.items():
-            # Add back records that were deleted
-            if dn not in data:
-                self.ldap_conn.add_s(dn, list(attrs.items()))
+            systemctl stop dirsrv.target
+            set +e
+            count=0
+            while pgrep -a ns-slapd > /dev/null; do
+                if [ "$count" -ge "60" ]; then
+                    echo "Directory server failed to stop in 60 seconds"
+                    exit 1
+                fi
+                ((count++))
+                sleep 1
+            done
+            set -e
 
+            restore "{backup_path}/dirsrv-etc" /etc/dirsrv
+            restore "{backup_path}/dirsrv-lib" /var/lib/dirsrv
+            systemctl start dirsrv.target
+
+            for _ in $(seq 30); do
+                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+                sleep 1
+            done
+            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+            """,
+            log_level=ProcessLogLevel.Error,
+        )
         self.extra_naming_contexts.clear()
-
-    def _backup_naming_contexts(self) -> set[str]:
-        """Naming contexts included in backup/restore (default, tracked, rootDSE)."""
-        contexts = {self.naming_context, *self.extra_naming_contexts}
-        try:
-            result = self.ldap_conn.search_s("", ldap.SCOPE_BASE, attrlist=["namingContexts"])
-        except ldap.LDAPError:
-            return contexts
-
-        if not result:
-            return contexts
-
-        _, attrs = result[0]
-        for key, values in attrs.items():
-            if key.lower() == "namingcontexts":
-                contexts.update(v.decode("utf-8") for v in values)
-        return contexts
-
-    def _ldap_state(self) -> dict[str, dict[str, list[bytes]]]:
-        """
-        Snapshot LDAP entries covered by backup/restore.
-
-        Includes every naming context, ``cn=config``, mapping-tree children, and
-        backend instances so extra suffixes created during a test are visible to
-        restore and removed when absent from the backup.
-        """
-        dct: dict[str, dict[str, list[bytes]]] = {}
-
-        for nc in self._backup_naming_contexts():
-            try:
-                data = self.ldap_conn.search_s(nc, ldap.SCOPE_SUBTREE)
-                dct.update(self.ldap_result_to_dict(data))
-                nc_aci = self.ldap_conn.search_s(nc, ldap.SCOPE_BASE, attrlist=["aci"])
-                dct.update(self.ldap_result_to_dict(nc_aci))
-            except ldap.NO_SUCH_OBJECT:
-                continue
-
-        config = self.ldap_conn.search_s("cn=config", ldap.SCOPE_BASE)
-        dct.update(self.ldap_result_to_dict(config))
-
-        for base, scope in (
-            ("cn=mapping tree,cn=config", ldap.SCOPE_ONELEVEL),
-            ("cn=ldbm database,cn=plugins,cn=config", ldap.SCOPE_SUBTREE),
-        ):
-            try:
-                entries = self.ldap_conn.search_s(base, scope)
-                dct.update(self.ldap_result_to_dict(entries))
-            except ldap.NO_SUCH_OBJECT:
-                continue
-
-        return dct
-
-    @staticmethod
-    def _restore_delete_key(dn: str) -> tuple[int, int, str]:
-        """Sort key: suffix data, then mapping tree, then backends; deeper first."""
-        dn_l = dn.lower()
-        if "cn=mapping tree,cn=config" in dn_l:
-            phase = 1
-        elif "cn=ldbm database,cn=plugins,cn=config" in dn_l:
-            phase = 2
-        elif dn_l == "cn=config" or dn_l.endswith(",cn=config"):
-            phase = 3
-        else:
-            phase = 0
-        return (phase, -dn.count(","), dn)
-
-    def __filter_modlist(self, dn: str, modlist: list) -> list:
-        """
-        Remove special items that can not be modified from ``modlist``.
-
-        :param dn: Object's DN.
-        :type dn: str
-        :param modlist: LDAP modlist.
-        :type modlist: list
-        :return: Filtered modlist.
-        :rtype: list
-        """
-        if dn != "cn=config":
-            return modlist
-
-        result = []
-        for op, attr, value in modlist:
-            # We are not allowed to touch these
-            if attr.startswith("nsslapd"):
-                continue
-
-            result.append((op, attr, value))
-
-        return result
