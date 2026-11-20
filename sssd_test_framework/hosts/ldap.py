@@ -23,9 +23,8 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
 
     .. note::
 
-        Full backup and restore is supported by copying ``/etc/dirsrv`` and
-        ``/var/lib/dirsrv`` (same approach as IPA in PR #288). Extra naming
-        contexts from tests are covered by the filesystem restore.
+        Full backup and restore is supported via ``dsctl db2bak`` / ``bak2db``.
+        Extra naming contexts from tests are covered by the database restore.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -291,7 +290,7 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
             raise TypeError(f"Expected PurePosixPath, got {type(backup_data)}")
 
         self.conn.run(
-            f'rm --force --recursive "{backup_data}"',
+            f'rm --force --recursive "{backup_data}" "{backup_data}.db2bak"',
             log_level=ProcessLogLevel.Error,
         )
 
@@ -305,12 +304,10 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         """
         Backup all directory server data.
 
-        Stop 389-ds, wait for ``ns-slapd`` to exit (same race fix as IPA PR
-        #298), copy ``/etc/dirsrv`` and ``/var/lib/dirsrv``, then start and wait
-        until LDAP answers. This avoids LDAP modify-based restore failures such
-        as ``ldap.UNWILLING_TO_PERFORM`` that left users behind and caused later
-        ``ldap.ALREADY_EXISTS``, and avoids ``ldap.SERVER_DOWN`` from copying
-        or reconnecting while the server is still stopping/starting.
+        Stop 389-ds, wait for ``ns-slapd`` to exit, then take a binary database
+        backup with ``dsctl db2bak`` (same approach as sssd-ci-containers LDAP
+        image and IPA PR #298). Plain filesystem copies of ``/var/lib/dirsrv``
+        leave the instance unable to answer LDAP after restart on RHEL.
 
         :return: Backup data.
         :rtype: Any
@@ -321,18 +318,11 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         result = self.conn.run(
             """
             set -x
-
-            function backup {
-                if [ -d "$1" ] || [ -f "$1" ]; then
-                    cp --force --archive "$1" "$2"
-                fi
-            }
-
             set -e
 
             path=`mktemp -d`
 
-            systemctl stop dirsrv.target
+            systemctl stop dirsrv@localhost.service || systemctl stop dirsrv.target
             set +e
             count=0
             while pgrep -a ns-slapd > /dev/null; do
@@ -340,21 +330,21 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
                     echo "Directory server failed to stop in 60 seconds"
                     exit 1
                 fi
-                ((count++))
+                count=$((count + 1))
                 sleep 1
             done
             set -e
 
-            backup /etc/dirsrv "$path/dirsrv-etc"
-            backup /var/lib/dirsrv "$path/dirsrv-lib"
-            systemctl start dirsrv.target
+            ds_inst=`dsctl -l | sed 's/^slapd-//' | head -n1`
+            dsctl "$ds_inst" db2bak "$path.db2bak"
 
-            # systemctl returning does not mean LDAP is answering yet
-            for _ in $(seq 30); do
-                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+            systemctl start dirsrv@localhost.service || systemctl start dirsrv.target
+
+            for _ in $(seq 60); do
+                ldapsearch -x -H 'ldap://127.0.0.1' -b '' -s base > /dev/null 2>&1 && break
                 sleep 1
             done
-            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+            ldapsearch -x -H 'ldap://127.0.0.1' -b '' -s base > /dev/null
 
             echo $path
             """,
@@ -367,11 +357,10 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         """
         Restore directory server data.
 
-        Stop 389-ds, wait for ``ns-slapd`` to exit, replace ``/etc/dirsrv`` and
-        ``/var/lib/dirsrv`` from the backup created by :meth:`backup`, then start
-        and wait until LDAP answers. File copy restores the full database state
-        (including test users), so teardown cannot leave leftovers that fail
-        later with ``ldap.ALREADY_EXISTS``.
+        Stop 389-ds, wait for ``ns-slapd`` to exit, restore the binary backup
+        created by :meth:`backup` with ``dsctl bak2db``, then start and wait
+        until LDAP answers. This restores the full database state (including
+        test users and extra naming contexts).
 
         :return: Backup data.
         :rtype: Any
@@ -389,17 +378,9 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
         self.conn.run(
             f"""
             set -x
-
-            function restore {{
-                rm --force --recursive "$2"
-                if [ -d "$1" ] || [ -f "$1" ]; then
-                    cp --force --archive "$1" "$2"
-                fi
-            }}
-
             set -e
 
-            systemctl stop dirsrv.target
+            systemctl stop dirsrv@localhost.service || systemctl stop dirsrv.target
             set +e
             count=0
             while pgrep -a ns-slapd > /dev/null; do
@@ -407,20 +388,21 @@ class LDAPHost(BaseLDAPDomainHost, BaseLinuxHost):
                     echo "Directory server failed to stop in 60 seconds"
                     exit 1
                 fi
-                ((count++))
+                count=$((count + 1))
                 sleep 1
             done
             set -e
 
-            restore "{backup_path}/dirsrv-etc" /etc/dirsrv
-            restore "{backup_path}/dirsrv-lib" /var/lib/dirsrv
-            systemctl start dirsrv.target
+            ds_inst=`dsctl -l | sed 's/^slapd-//' | head -n1`
+            dsctl "$ds_inst" bak2db "{backup_path}.db2bak"
 
-            for _ in $(seq 30); do
-                ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null 2>&1 && break
+            systemctl start dirsrv@localhost.service || systemctl start dirsrv.target
+
+            for _ in $(seq 60); do
+                ldapsearch -x -H 'ldap://127.0.0.1' -b '' -s base > /dev/null 2>&1 && break
                 sleep 1
             done
-            ldapsearch -x -H 'ldap://localhost' -b '' -s base > /dev/null
+            ldapsearch -x -H 'ldap://127.0.0.1' -b '' -s base > /dev/null
             """,
             log_level=ProcessLogLevel.Error,
         )
